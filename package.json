@@ -1,0 +1,32 @@
+{
+  "name": "umeko-remote-web-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Key-authenticated remote desktop, web SSH, SFTP file manager and headless outbound connector.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/umeiko/umeko-remote-web-desktop.git"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node remote/server.js",
+    "agent": "node remote/agent.js",
+    "desktop": "python3 remote/desktop.py",
+    "keys": "node remote/keys.js",
+    "test": "npm run test:node && npm run test:service",
+    "test:node": "node --test remote/test/*.test.js",
+    "test:service": "python3 -m unittest discover -s remote/test -p '*_test.py'"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/websocket": "^11.2.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "fastify": "^5.6.2",
+    "ssh2": "^1.17.0",
+    "ws": "^8.18.3"
+  }
+}

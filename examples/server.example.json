@@ -1,0 +1,19 @@
+{
+  "origin": "https://your-domain.example",
+  "path": "/remote",
+  "port": 3101,
+  "guacdPort": 4822,
+  "desktopUser": "your-user",
+  "stateFile": "/var/lib/umeko-remote/state.json",
+  "adminKeys": [
+    {
+      "id": "ADMIN_KEY_ID",
+      "publicKey": "REPLACE_WITH_ADMIN_PUBLIC_KEY_PEM"
+    }
+  ],
+  "device": {
+    "id": "DEVICE_KEY_ID",
+    "publicKey": "REPLACE_WITH_DEVICE_PUBLIC_KEY_PEM",
+    "name": "家中电脑"
+  }
+}
