@@ -116,9 +116,10 @@ test('desktop performs guacd handshake, relays the RDP port and handles internal
   const guacd = net.createServer((socket) => {
     peers.add(socket); socket.on('close', () => peers.delete(socket));
     const parser = new GuacParser(([opcode, ...args]) => {
-      if (opcode === 'select') socket.write(instruction('args', 'VERSION_1_5_0', 'hostname', 'port', 'username', 'password'));
+      if (opcode === 'select') socket.write(instruction('args', 'VERSION_1_5_0', 'hostname', 'port', 'username', 'password', 'umeko-image-quality'));
       if (opcode === 'connect') {
         assert.equal(args[0], 'VERSION_1_5_0'); assert.equal(args[1], '127.0.0.1');
+        assert.equal(args[5], '52');
         portFromHandshake = Number(args[2]);
         const peer = net.connect({ host: '127.0.0.1', port: portFromHandshake });
         peers.add(peer); peer.on('close', () => peers.delete(peer));
@@ -136,16 +137,21 @@ test('desktop performs guacd handshake, relays the RDP port and handles internal
   t.after(stop);
   const { cookie } = await loginWithKey(f.base, f.admin.identity);
   await until(async () => (await (await f.status(cookie)).json()).device.online);
-  const { ticket } = await (await f.post('desktop-ticket', { username: 'umeko', password: '', width: 1024, height: 768 }, cookie)).json();
+  const { ticket } = await (await f.post('desktop-ticket', { username: 'umeko', password: '', width: 1024, height: 768, quality: 52 }, cookie)).json();
   const socket = new WebSocket(`${f.base.replace('http', 'ws')}/ws/desktop`, { headers: { cookie, origin: f.origin } });
   t.after(() => socket.terminate());
   let output = '';
-  socket.on('message', (data) => { output += data; });
-  await once(socket, 'open'); socket.send(JSON.stringify({ ticket }));
+  const controls = [];
+  socket.on('message', (data, binary) => {
+    if (binary) controls.push(JSON.parse(data.toString()));
+    else output += data;
+  });
+  await once(socket, 'open'); socket.send(JSON.stringify({ ticket, telemetry: true }));
   await until(() => output.includes('test-uuid') && rdpData === 'RDP-TEST');
+  assert.deepEqual(controls[0], { type: 'desktop', imageQuality: true });
   assert.ok(portFromHandshake > 0);
   socket.send(instruction('', 'ping', '12345'));
-  await until(() => output.includes(instruction('', 'ping', '12345')));
+  await until(() => controls.some((control) => control.type === 'pong' && control.stamp === '12345'));
   socket.send(instruction('key', 97, 1));
   await until(() => keyData === '97,1');
 });

@@ -1,0 +1,176 @@
+diff --git a/src/libguac/client.c b/src/libguac/client.c
+index 5926e9c..49b85ca 100644
+--- a/src/libguac/client.c
++++ b/src/libguac/client.c
+@@ -268,6 +268,7 @@ guac_client* guac_client_alloc() {
+ 
+     client->args = __GUAC_CLIENT_NO_ARGS;
+     client->state = GUAC_CLIENT_RUNNING;
++    client->__lossy_quality_cap = 90;
+     client->last_sent_timestamp = guac_timestamp_current();
+ 
+     /* Generate ID */
+@@ -754,6 +755,15 @@ static void* __calculate_lag(guac_user* user, void* data) {
+ 
+ }
+ 
++void guac_client_set_lossy_quality_cap(guac_client* client, int quality) {
++    if (quality >= 30 && quality <= 90)
++        __atomic_store_n(&client->__lossy_quality_cap, quality, __ATOMIC_RELAXED);
++}
++
++int guac_client_get_lossy_quality_cap(guac_client* client) {
++    return __atomic_load_n(&client->__lossy_quality_cap, __ATOMIC_RELAXED);
++}
++
+ int guac_client_get_processing_lag(guac_client* client) {
+ 
+     int processing_lag = 0;
+diff --git a/src/libguac/display-worker.c b/src/libguac/display-worker.c
+index 813306f..00c308e 100644
+--- a/src/libguac/display-worker.c
++++ b/src/libguac/display-worker.c
+@@ -132,9 +132,10 @@ static int guac_display_suggest_quality(guac_client* client) {
+     /* Scale quality linearly from 90 to 30 as lag varies from 20ms to 80ms */
+     int quality = 90 - (lag - 20);
+ 
+-    /* Do not exceed 90 for quality */
+-    if (quality > 90)
+-        return 90;
++    /* Apply the session's quality cap while keeping the native lag response. */
++    int cap = guac_client_get_lossy_quality_cap(client);
++    if (quality > cap)
++        return cap;
+ 
+     /* Do not go below 30 for quality */
+     if (quality < 30)
+diff --git a/src/libguac/guacamole/client.h b/src/libguac/guacamole/client.h
+index 01ecbc8..521416d 100644
+--- a/src/libguac/guacamole/client.h
++++ b/src/libguac/guacamole/client.h
+@@ -311,6 +311,11 @@ struct guac_client {
+      */
+     void* __plugin_handle;
+ 
++    /**
++     * Upper limit for lossy display encoding. Access via the quality API.
++     */
++    int __lossy_quality_cap;
++
+ };
+ 
+ /**
+@@ -652,6 +657,17 @@ int guac_client_load_plugin(guac_client* client, const char* protocol);
+  */
+ int guac_client_get_processing_lag(guac_client* client);
+ 
++/**
++ * Sets the maximum quality for lossy display updates (30 through 90).
++ * Invalid values leave the current cap in place. Thread-safe.
++ */
++void guac_client_set_lossy_quality_cap(guac_client* client, int quality);
++
++/**
++ * Returns the current maximum quality for lossy display updates. Thread-safe.
++ */
++int guac_client_get_lossy_quality_cap(guac_client* client);
++
+ /**
+  * Sends a request to the owner of the given guac_client for parameters required
+  * to continue the connection started by the client. The function returns zero
+diff --git a/src/protocols/rdp/argv.h b/src/protocols/rdp/argv.h
+index 0774522..d7271da 100644
+--- a/src/protocols/rdp/argv.h
++++ b/src/protocols/rdp/argv.h
+@@ -43,6 +43,8 @@ guac_argv_callback guac_rdp_argv_callback;
+  */
+ #define GUAC_RDP_ARGV_PASSWORD "password"
+ 
++#define GUAC_RDP_ARGV_IMAGE_QUALITY "umeko-image-quality"
++
+ /**
+  * The name of the parameter that specifies/updates the domain name that will be
+  * sent to the RDP server during authentication.
+diff --git a/src/protocols/rdp/settings.c b/src/protocols/rdp/settings.c
+index 4c10c15..d3d7b1f 100644
+--- a/src/protocols/rdp/settings.c
++++ b/src/protocols/rdp/settings.c
+@@ -151,6 +151,7 @@ const char* GUAC_RDP_CLIENT_ARGS[] = {
+ 
+     "force-lossless",
+     "normalize-clipboard",
++    GUAC_RDP_ARGV_IMAGE_QUALITY,
+     NULL
+ };
+ 
+@@ -723,6 +724,8 @@ enum RDP_ARGS_IDX {
+      */
+     IDX_NORMALIZE_CLIPBOARD,
+ 
++    IDX_IMAGE_QUALITY,
++
+     RDP_ARGS_COUNT
+ };
+ 
+@@ -1358,6 +1361,11 @@ guac_rdp_settings* guac_rdp_parse_args(guac_user* user,
+         
+     }
+ 
++    if (user->owner)
++        guac_client_set_lossy_quality_cap(user->client,
++                guac_user_parse_args_int(user, GUAC_RDP_CLIENT_ARGS, argv,
++                    IDX_IMAGE_QUALITY, 90));
++
+     /* Success */
+     return settings;
+ 
+diff --git a/src/protocols/rdp/user.c b/src/protocols/rdp/user.c
+index 5e115eb..06328ba 100644
+--- a/src/protocols/rdp/user.c
++++ b/src/protocols/rdp/user.c
+@@ -22,6 +22,7 @@
+ #include "channels/pipe-svc.h"
+ #include "config.h"
+ #include "input.h"
++#include "argv.h"
+ #include "rdp.h"
+ #include "settings.h"
+ #include "upload.h"
+@@ -42,6 +43,24 @@
+ 
+ #include <pthread.h>
+ #include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++
++static int guac_rdp_image_quality_callback(guac_user* user, const char* mimetype,
++        const char* name, const char* value, void* data) {
++
++    if (!user->owner || strcmp(mimetype, "text/plain") != 0)
++        return 1;
++
++    char* end;
++    long quality = strtol(value, &end, 10);
++    if (quality < 30 || quality > 90 || *end != '\0')
++        return 1;
++
++    guac_client_set_lossy_quality_cap(user->client, (int) quality);
++    return 0;
++
++}
+ 
+ int guac_rdp_user_join_handler(guac_user* user, int argc, char** argv) {
+ 
+@@ -106,8 +125,11 @@ int guac_rdp_user_join_handler(guac_user* user, int argc, char** argv) {
+         user->pipe_handler = guac_rdp_pipe_svc_pipe_handler;
+         
+         /* If we own it, register handler for updating parameters during connection. */
+-        if (user->owner)
++        if (user->owner) {
++            guac_argv_register(GUAC_RDP_ARGV_IMAGE_QUALITY,
++                    guac_rdp_image_quality_callback, NULL, 0);
+             user->argv_handler = guac_argv_handler;
++        }
+ 
+     }
+ 

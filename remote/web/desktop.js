@@ -1,16 +1,23 @@
 'use strict';
 (() => {
   const encoder = new TextEncoder();
-  const ratios = [1, 0.82, 0.66, 0.52];
+  const qualityCaps = [90, 70, 52, 36];
 
-  function dimensions(viewport, mode, tier = 0) {
-    const width = Math.max(1024, Math.min(1600, viewport.width));
-    const height = Math.max(640, Math.min(1000, viewport.height));
-    const scale = mode === 'low' ? ratios[2] : mode === 'high' ? 1 : ratios[tier];
+  function dimensions(selection, viewport) {
+    if (selection !== 'fit') {
+      const [width, height] = selection.split('x').map(Number);
+      return { width, height };
+    }
     return {
-      width: Math.max(640, Math.floor(width * scale / 4) * 4),
-      height: Math.max(480, Math.floor(height * scale / 4) * 4),
+      width: Math.max(1024, Math.min(3840, Math.floor(viewport.width / 4) * 4)),
+      height: Math.max(640, Math.min(2160, Math.floor(viewport.height / 4) * 4)),
     };
+  }
+
+  function imageQuality(mode, tier) {
+    if (mode === 'high') return qualityCaps[0];
+    if (mode === 'low') return qualityCaps.at(-1);
+    return qualityCaps[tier];
   }
 
   function adaptiveState(tier = 0) {
@@ -24,7 +31,7 @@
           stats.rtt !== null && stats.rtt < Math.max(320, bestRtt * 1.55);
         pressure = congested ? pressure + 1 : 0;
         clear = quiet ? clear + 1 : 0;
-        if (pressure >= 3 && tier < ratios.length - 1 && now - changed > 10000) {
+        if (pressure >= 3 && tier < qualityCaps.length - 1 && now - changed > 10000) {
           changed = now; pressure = 0; clear = 0;
           return ++tier;
         }
@@ -37,7 +44,7 @@
     };
   }
 
-  function createTunnel({ url, ticket, onClosed, onStats }) {
+  function createTunnel({ url, ticket, onClosed, onStats, onCapabilities }) {
     const tunnel = new Guacamole.Tunnel();
     let socket, timer, intentional = false, closeHint;
     let lastReceived = 0, sampleAt = 0, lastPing = 0, lastPong = 0, bytes = 0;
@@ -90,6 +97,10 @@
             return;
           }
           const stats = JSON.parse(new TextDecoder().decode(event.data));
+          if (stats.type === 'desktop') {
+            onCapabilities(stats.imageQuality === true);
+            return;
+          }
           if (stats.type !== 'pong' || !pings.has(stats.stamp)) return;
           lastPong = lastReceived;
           rtt = Math.round(lastReceived - pings.get(stats.stamp));
@@ -128,5 +139,6 @@
     return tunnel;
   }
 
-  globalThis.UmekoRemoteDesktop = { adaptiveState, createTunnel, dimensions };
+  globalThis.UmekoRemoteDesktop = { adaptiveState, createTunnel, dimensions, imageQuality,
+    maxQualityTier: qualityCaps.length - 1 };
 })();

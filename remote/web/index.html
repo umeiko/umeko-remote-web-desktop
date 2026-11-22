@@ -29,13 +29,51 @@
   </main>
   <footer><span>UMEKO LAB <i>/</i> 远程工作，自由连接</span><a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer">黔ICP备2026019339号</a><span>密钥认证 · HTTPS / WSS</span></footer>
   <dialog id="desktop-login"><form id="desktop-form"><div class="dialog-heading"><h2>连接家中的桌面</h2><button type="button" id="cancel-desktop" class="text-button" aria-label="取消连接">×</button></div><p class="muted">使用这台电脑的系统账号。密码留空时，可在远程桌面的登录界面输入。</p><label class="field">系统用户名<input id="desktop-user" value="umeko" autocomplete="username" maxlength="128"></label><label class="field">系统密码（可选）<input id="desktop-password" type="password" autocomplete="off" maxlength="512"></label><label class="desktop-auto"><input id="desktop-auto" type="checkbox" checked> 短暂断线时自动重连</label><p class="hint">开启自动重连时，系统密码仅在当前页面的内存中保留。密码留空时，重连后可能需要在 xrdp 界面再次登录。</p><button class="primary" type="submit">打开远程桌面 ↗</button></form></dialog>
-  <section id="desktop-view" class="desktop-view" hidden><div class="desktop-toolbar"><span class="desktop-title"><i></i> UMEKO <b>/</b> 远程桌面</span><span id="desktop-state" role="status">正在连接…</span><div><button id="desktop-ime" class="secondary" title="切换远程拼音输入法（Ctrl + 空格）">中/英</button><button id="desktop-files" class="secondary">文件</button><button id="desktop-keyboard" class="secondary">键盘</button><button id="desktop-clipboard" class="secondary">剪贴板</button><button id="desktop-ctrl-alt-del" class="secondary">Ctrl Alt Del</button><button id="desktop-fullscreen" class="secondary">全屏</button><button id="desktop-retry" class="secondary" hidden>重新连接</button><button id="desktop-disconnect" class="danger">断开连接</button></div></div>
-    <div class="desktop-network" aria-label="桌面连接信息">
-      <span class="desktop-metric" title="此浏览器到云端中继的 WebSocket 往返时间">中继延迟 <b id="desktop-latency">—</b></span>
-      <span class="desktop-metric" title="此浏览器接收的实际桌面协议数据">桌面下行 <b id="desktop-bitrate">—</b></span>
-      <span class="desktop-metric">桌面分辨率 <b id="desktop-resolution">—</b></span>
-      <label>画质 <select id="desktop-quality"><option value="auto">自动</option><option value="high">清晰</option><option value="low">省流</option></select></label>
-    </div><div id="display" tabindex="0" aria-label="远程桌面，点击后可使用键盘和鼠标"></div><textarea id="mobile-input" aria-label="向远程桌面输入文本" placeholder="在此输入文字，然后点击发送"></textarea><button id="send-mobile" class="secondary" hidden>发送文字</button></section>
+  <section id="desktop-view" class="desktop-view" hidden>
+    <div class="desktop-toolbar">
+      <span class="desktop-title">UMEKO <b>/</b> 远程桌面</span>
+      <span id="desktop-state" role="status">正在连接…</span>
+      <div class="desktop-controls">
+        <div class="desktop-tools">
+          <button id="desktop-tools-toggle" class="secondary" aria-controls="desktop-tools-panel" aria-expanded="false">工具</button>
+          <div id="desktop-tools-panel" class="desktop-tools-panel" role="group" aria-label="桌面工具">
+            <button id="desktop-ime" class="secondary" title="切换远程拼音输入法（Ctrl + 空格）">中/英</button>
+            <button id="desktop-files" class="secondary">文件</button>
+            <button id="desktop-keyboard" class="secondary">键盘</button>
+            <button id="desktop-clipboard" class="secondary">剪贴板</button>
+            <button id="desktop-ctrl-alt-del" class="secondary">Ctrl Alt Del</button>
+          </div>
+        </div>
+        <details id="desktop-settings" class="desktop-settings">
+          <summary class="secondary" aria-label="连接信息与画面设置">连接 <span id="desktop-network-brief" aria-hidden="true"></span><span aria-hidden="true">▾</span></summary>
+          <div class="desktop-settings-panel">
+            <dl class="desktop-metrics">
+              <div title="此浏览器到云端中继的 WebSocket 往返时间"><dt>中继延迟</dt><dd id="desktop-latency">—</dd></div>
+              <div title="此浏览器接收的实际桌面协议数据"><dt>桌面下行</dt><dd id="desktop-bitrate">—</dd></div>
+              <div><dt>当前分辨率</dt><dd id="desktop-resolution">—</dd></div>
+            </dl>
+            <label>画质 <select id="desktop-quality" disabled aria-describedby="desktop-quality-help"><option value="auto">自动</option><option value="high">清晰</option><option value="low">省流</option></select></label>
+            <p id="desktop-quality-help" class="hint" hidden></p>
+            <form id="desktop-size-form">
+              <label>桌面分辨率 <select id="desktop-size">
+                <option value="fit">按当前窗口</option><option value="1024x768">1024 × 768</option>
+                <option value="1280x720">1280 × 720</option><option value="1440x900">1440 × 900</option>
+                <option value="1600x900">1600 × 900</option><option value="1920x1080">1920 × 1080</option>
+                <option value="2560x1440">2560 × 1440</option><option value="3840x2160">3840 × 2160</option>
+              </select></label>
+              <button class="secondary" type="submit">应用分辨率</button>
+            </form>
+          </div>
+        </details>
+        <button id="desktop-fullscreen" class="secondary">全屏</button>
+        <button id="desktop-retry" class="secondary" hidden>重连</button>
+        <button id="desktop-disconnect" class="danger">断开</button>
+      </div>
+    </div>
+    <div id="display" tabindex="0" aria-label="远程桌面，点击后可使用键盘和鼠标"></div>
+    <textarea id="mobile-input" aria-label="向远程桌面输入文本" placeholder="在此输入文字，然后点击发送"></textarea>
+    <button id="send-mobile" class="secondary" hidden>发送文字</button>
+  </section>
   <section id="files-view" class="tool-view" hidden aria-label="文件管理">
     <div class="tool-toolbar"><div><span class="eyebrow">UMEKO / FILES</span><h2>家中电脑的文件</h2></div><span id="files-user" class="muted"></span><button id="close-files" class="secondary">返回工作台 ×</button></div>
     <div class="file-navigation"><button id="files-home" class="secondary">主目录</button><button id="files-parent" class="secondary">上一级 ↑</button><form id="files-path-form"><input id="files-path" aria-label="当前目录的绝对路径" placeholder="/home/user" autocomplete="off"><button class="secondary">前往</button></form><button id="files-refresh" class="secondary">刷新</button></div>

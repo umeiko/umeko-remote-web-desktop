@@ -71,6 +71,8 @@ Host umeko-home
 
 服务器需要 Node.js 22 和 Apache Guacamole **guacd 1.6.0**，其中启用 RDP 协议。Debian 13 可从 Apache 官方源码构建，安装 `freerdp3-dev` 等构建依赖。FreeRDP 3 在该 Guacamole 版本中属于实验支持，部署后需要实际验证桌面连接。某些 FreeRDP 版本在头文件中触发弃用警告，可通过配置时设置 `CFLAGS='-O2 -Wno-error=deprecated-declarations'` 处理；保留其他编译错误检查。
 
+若要在网页调节压缩画质，配置和构建前，在 Guacamole 1.6.0 的源码目录运行 `patch -p1 < /path/to/umeko-remote-web-desktop/remote/deploy/guacamole-image-quality.patch`。同一次构建的 `guacd`、`libguac` 和 RDP 插件需要一同部署。使用独立安装目录时，将该目录的 `lib` 加到 guacd 服务的 `LD_LIBRARY_PATH`，并将服务的 `ExecStart` 指向对应的 `sbin/guacd`。原版 guacd 仍可连接，使用 Guacamole 内置的自动压缩。
+
 `remote/vendor/` 保留 Apache Guacamole 官方 JavaScript 客户端及许可证，不通过第三方 CDN 加载代码。
 
 先在仓库外的私密目录生成密钥：
@@ -173,7 +175,7 @@ journalctl -u umeko-remote -n 50 --no-pager
 
 无法连接桌面时，检查本机 xrdp 是否监听配置端口、连接器是否在线、guacd 服务是否运行。网页无法登录时，确认使用管理员密钥、浏览器支持 Ed25519 Web Crypto，并检查域名是否与配置的 origin 完全一致。
 
-桌面工具栏显示中继 RTT、实际桌面下行数据速率与远端分辨率。自动画质在链路拥塞或连续绘制积压时请求较低的桌面分辨率，恢复稳定后再逐步调高。可手动选择「省流」或「清晰」。分辨率请求由 RDP 的 Display Update 通道处理，下行数据速率随画面更新变化。
+桌面顶栏的「连接」菜单显示中继 RTT、实际桌面下行数据速率和当前分辨率。自动画质在链路拥塞或绘制积压时降低 JPEG 压缩质量上限，链路稳定后再逐步调高。也可选择「清晰」或「省流」。Guacamole 按区域决定使用 PNG 或 JPEG，因此下行速率会随画面变化。「应用分辨率」通过 RDP Display Update 通道调整桌面尺寸，短暂断线重连会沿用该尺寸。
 
 短暂断线后，工作台会在当前登录有效时重新申请一次性桌面票据。勾选自动重连并在工作台表单填写系统密码，可让重连带上该密码。密码仅保留在当前页面内存，手动断开、退出或关闭页面会清除。如果在 xrdp 的远端登录界面输入密码，浏览器重连时可能再次显示登录界面。
 

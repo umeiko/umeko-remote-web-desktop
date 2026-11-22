@@ -37,15 +37,19 @@ export class GuacParser {
   }
 }
 
-export async function openDesktop({ guacdPort, rdpPort, username, password, width, height, onData, onSocket }) {
+const imageQualityArg = 'umeko-image-quality';
+
+export async function openDesktop({ guacdPort, rdpPort, username, password, width, height, quality,
+  onData, onSocket, onCapabilities }) {
   const socket = net.connect({ host: '127.0.0.1', port: guacdPort });
   onSocket?.(socket);
   const decoder = new StringDecoder('utf8');
-  let ready = false;
+  let ready = false, imageQuality = false;
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => { socket.destroy(); reject(new Error('桌面网关连接超时')); }, 20000);
     const parser = new GuacParser(([opcode, ...args]) => {
       if (opcode === 'args') {
+        imageQuality = args.includes(imageQualityArg);
         const parameters = {
           hostname: '127.0.0.1', port: String(rdpPort), username, password,
           security: 'tls', 'ignore-cert': 'true', 'disable-auth': password ? 'false' : 'true',
@@ -53,6 +57,7 @@ export async function openDesktop({ guacdPort, rdpPort, username, password, widt
           'resize-method': 'display-update', 'disable-audio': 'true',
           'enable-drive': 'false', 'enable-printing': 'false', 'disable-upload': 'true', 'disable-download': 'true',
           'server-layout': 'en-us-qwerty', 'color-depth': '32', 'timezone': 'America/New_York',
+          [imageQualityArg]: String(quality),
         };
         socket.write(instruction('size', width, height, 96));
         socket.write(instruction('audio'));
@@ -64,6 +69,7 @@ export async function openDesktop({ guacdPort, rdpPort, username, password, widt
         clearTimeout(timeout);
         // The WebSocket tunnel expects an internal UUID instruction first.
         onData(instruction('', args[0]));
+        onCapabilities?.({ imageQuality });
         if (parser.buffer) { const rest = parser.buffer; parser.buffer = ''; onData(rest); }
         resolve(socket);
       } else if (opcode === 'error') {

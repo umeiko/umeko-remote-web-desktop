@@ -207,10 +207,11 @@ export async function createRemoteServer(config) {
     rateLimit(request, 'desktop', 10);
     const session = getSession(request);
     if (!device) throw fail('本机连接器离线', 409);
-    const { username = config.desktopUser || '', password = '', width, height } = request.body || {};
+    const { username = config.desktopUser || '', password = '', width, height, quality = 90 } = request.body || {};
     if (typeof username !== 'string' || username.length > 128 || typeof password !== 'string' || password.length > 512) throw fail('登录信息格式不正确');
     return { ticket: issueTicket({ role: 'desktop', sessionId: session.id, username, password,
-      width: bounded(width, 640, 3840, 1440), height: bounded(height, 480, 2160, 900) }) };
+      width: bounded(width, 640, 3840, 1440), height: bounded(height, 480, 2160, 900),
+      quality: bounded(quality, 30, 90, 90) }) };
   });
   app.get(`${base}/ws/device`, { websocket: true }, (socket, request) => {
     try { checkOrigin(request, false); rateLimit(request, 'device-ws', 20); } catch { return socket.close(1008); }
@@ -302,7 +303,10 @@ export async function createRemoteServer(config) {
         await new Promise((resolve, reject) => { localServer.once('error', reject); localServer.listen(0, '127.0.0.1', resolve); });
         if (socket.readyState !== 1) return cleanup();
         desktopSocket = await openDesktop({ guacdPort: config.guacdPort || 4822, rdpPort: localServer.address().port, ...credentials,
-          onData: output.send, onSocket: (value) => { desktopSocket = value; output.bind(value); } });
+          onData: output.send, onSocket: (value) => { desktopSocket = value; output.bind(value); },
+          onCapabilities: (capabilities) => {
+            if (telemetry === true) output.control({ type: 'desktop', ...capabilities });
+          } });
         credentials.password = '';
         if (socket.readyState !== 1) return cleanup();
         let lastProbe = 0;

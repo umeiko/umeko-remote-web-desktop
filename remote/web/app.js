@@ -92,7 +92,27 @@ $('desktop-login').addEventListener('close', () => { $('desktop-password').value
 
 const retryDelays = [1000, 2400, 5000, 9500, 15000];
 const desktopUrl = `${location.origin.replace(/^http/, 'ws')}${base}/ws/desktop`;
-const desktopState = (message) => { $('desktop-state').textContent = message; };
+const desktopState = (message) => {
+  $('desktop-state').textContent = message;
+  $('desktop-state').title = message;
+};
+
+function desktopStats(latency = '—', bitrate = '—') {
+  $('desktop-latency').textContent = latency;
+  $('desktop-bitrate').textContent = bitrate;
+  $('desktop-network-brief').textContent = latency === '—' && bitrate === '—' ? '' : `${latency} · ${bitrate}`;
+}
+
+function qualityAvailable(supported) {
+  $('desktop-quality').disabled = supported !== true;
+  $('desktop-quality-help').textContent = '当前网关使用内置自动压缩';
+  show('desktop-quality-help', supported === false);
+}
+
+function closeDesktopMenus() {
+  $('desktop-settings').open = false;
+  $('desktop-tools-toggle').setAttribute('aria-expanded', 'false');
+}
 
 function releaseConnection() {
   if (attempt) attempt.password = '';
@@ -116,9 +136,10 @@ function disconnectDesktop() {
   }
   releaseConnection();
   $('display').replaceChildren();
-  $('desktop-latency').textContent = '—';
-  $('desktop-bitrate').textContent = '—';
+  desktopStats();
   $('desktop-resolution').textContent = '—';
+  qualityAvailable();
+  closeDesktopMenus();
   show('desktop-retry', false);
   show('desktop-view', false);
   document.body.classList.remove('remote-open');
@@ -136,22 +157,42 @@ function scaleDesktop() {
   display.scale(Math.min(region.clientWidth / width, region.clientHeight / height));
 }
 
-function requestDesktopSize(context) {
-  const { width, height } = UmekoRemoteDesktop.dimensions(context.viewport, context.mode, context.tier);
-  client?.sendSize(width, height);
+function desktopSize() {
+  const region = $('display');
+  return UmekoRemoteDesktop.dimensions($('desktop-size').value, { width: region.clientWidth, height: region.clientHeight });
+}
+
+function applyDesktopSize(current) {
+  const size = current.context.size;
+  if (!current.connectedAt || (current.size.width === size.width && current.size.height === size.height)) return;
+  current.size = size;
+  client.sendSize(size.width, size.height);
+}
+
+function applyImageQuality(current) {
+  if (!current?.connectedAt || !current.adjustableQuality) return;
+  const { mode, tier } = current.context;
+  const quality = UmekoRemoteDesktop.imageQuality(mode, tier);
+  if (current.quality === quality) return;
+  current.quality = quality;
+  const stream = client.createArgumentValueStream('text/plain', 'umeko-image-quality');
+  const writer = new Guacamole.StringWriter(stream);
+  writer.sendText(String(quality));
+  writer.sendEnd();
 }
 
 function endAttempt(current, message, retryable = true) {
   if (attempt !== current) return;
   const context = current.context;
   releaseConnection();
-  $('desktop-latency').textContent = '—';
-  $('desktop-bitrate').textContent = '—';
+  desktopStats();
+  $('desktop-resolution').textContent = '—';
+  qualityAvailable();
   if (desktop !== context) return;
   if (current.connectedAt && performance.now() - current.connectedAt > 30000) context.retries = 0;
   if (context.auto && retryable && context.retries < retryDelays.length && Date.now() < expires) {
     const delay = retryDelays[context.retries++];
-    if (context.mode === 'auto') context.tier = Math.min(3, context.tier + 1);
+    if (context.mode === 'auto') context.tier = Math.min(UmekoRemoteDesktop.maxQualityTier, context.tier + 1);
     desktopState(`${message} · ${Math.ceil(delay / 1000)} 秒后重连（${context.retries}/${retryDelays.length}）`);
     context.timer = setTimeout(() => openDesktop(context), delay);
   } else {
@@ -169,25 +210,34 @@ async function openDesktop(context) {
     return;
   }
   context.waiting = false;
-  const current = { context, connectedAt: 0, password: context.password };
+  const current = { context, connectedAt: 0, password: context.password, size: context.size,
+    quality: UmekoRemoteDesktop.imageQuality(context.mode, context.tier) };
   attempt = current;
   desktopState(context.retries ? '正在重新连接本机桌面…' : '正在连接…');
   try {
-    const size = UmekoRemoteDesktop.dimensions(context.viewport, context.mode, context.tier);
-    const { ticket } = await api('desktop-ticket', { ...size, username: context.username, password: context.password });
+    const { ticket } = await api('desktop-ticket', {
+      ...current.size, quality: current.quality, username: context.username, password: context.password,
+    });
     if (!context.auto) context.password = '';
     if (attempt !== current) return;
     const tunnel = UmekoRemoteDesktop.createTunnel({
       url: desktopUrl, ticket,
       onClosed: (code, hint) => endAttempt(current, hint || '桌面连接已断开', code !== 1008),
+      onCapabilities: (adjustableQuality) => {
+        if (attempt !== current) return;
+        current.adjustableQuality = adjustableQuality;
+        qualityAvailable(adjustableQuality);
+        applyImageQuality(current);
+      },
       onStats: (stats) => {
         if (attempt !== current) return;
-        $('desktop-latency').textContent = stats.rtt === null || stats.pingAge > 10000 ? '—' : `${stats.rtt} ms`;
-        $('desktop-bitrate').textContent = stats.bitrate >= 1000000
+        const latency = stats.rtt === null || stats.pingAge > 10000 ? '—' : `${stats.rtt} ms`;
+        const bitrate = stats.bitrate >= 1000000
           ? `${(stats.bitrate / 1000000).toFixed(2)} Mb/s` : `${Math.round(stats.bitrate / 1000)} kb/s`;
-        if (context.mode !== 'auto' || !current.connectedAt) return;
+        desktopStats(latency, bitrate);
+        if (context.mode !== 'auto' || !current.connectedAt || !current.adjustableQuality) return;
         const tier = current.adaptive.sample(stats, performance.now());
-        if (tier !== null) { context.tier = tier; requestDesktopSize(context); }
+        if (tier !== null) { context.tier = tier; applyImageQuality(current); }
       },
     });
     current.adaptive = UmekoRemoteDesktop.adaptiveState(context.tier);
@@ -205,6 +255,8 @@ async function openDesktop(context) {
         current.connectedAt = performance.now();
         current.password = '';
         desktopState('已连接');
+        applyDesktopSize(current);
+        applyImageQuality(current);
         scaleDesktop();
         if (!$('desktop-view').inert) $('display').focus();
       } else if (state === Guacamole.Client.State.DISCONNECTED) {
@@ -248,13 +300,13 @@ $('desktop-form').addEventListener('submit', (event) => {
   const context = {
     username: $('desktop-user').value, password: $('desktop-password').value,
     auto: $('desktop-auto').checked, mode: $('desktop-quality').value, tier: 0, retries: 0,
-    viewport: { width: innerWidth, height: innerHeight - 85 },
   };
   $('desktop-password').value = '';
   $('desktop-login').close();
   disconnectDesktop(); show('desktop-view');
   desktop = context;
   document.body.classList.add('remote-open'); $('workspace').inert = true;
+  context.size = desktopSize();
   openDesktop(context);
 });
 $('desktop-retry').addEventListener('click', () => $('desktop-login').showModal());
@@ -263,8 +315,40 @@ $('desktop-quality').addEventListener('change', () => {
   desktop.mode = $('desktop-quality').value;
   desktop.tier = 0;
   if (attempt) attempt.adaptive = UmekoRemoteDesktop.adaptiveState();
-  requestDesktopSize(desktop);
+  applyImageQuality(attempt);
 });
+$('desktop-size-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  if (!desktop) return;
+  desktop.size = desktopSize();
+  if (attempt) applyDesktopSize(attempt);
+  closeDesktopMenus();
+  if (!$('desktop-view').inert) $('display').focus();
+});
+$('desktop-tools-toggle').addEventListener('click', (event) => {
+  const expanded = event.currentTarget.getAttribute('aria-expanded') === 'true';
+  closeDesktopMenus();
+  event.currentTarget.setAttribute('aria-expanded', String(!expanded));
+});
+$('desktop-settings').addEventListener('toggle', () => {
+  if ($('desktop-settings').open) $('desktop-tools-toggle').setAttribute('aria-expanded', 'false');
+});
+document.addEventListener('click', (event) => {
+  if (!desktop || event.target.closest('.desktop-settings, .desktop-tools')) return;
+  closeDesktopMenus();
+});
+$('desktop-tools-panel').addEventListener('click', () => {
+  $('desktop-tools-toggle').setAttribute('aria-expanded', 'false');
+});
+$('desktop-view').addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  const trigger = $('desktop-settings').open ? $('desktop-settings').querySelector('summary')
+    : $('desktop-tools-toggle').getAttribute('aria-expanded') === 'true' ? $('desktop-tools-toggle') : null;
+  if (!trigger) return;
+  event.stopPropagation();
+  closeDesktopMenus();
+  trigger.focus();
+}, true);
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && desktop?.waiting) openDesktop(desktop);
 });
