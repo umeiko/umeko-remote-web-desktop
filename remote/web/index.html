@@ -5,7 +5,7 @@
   <meta name="robots" content="noindex, nofollow"><meta name="theme-color" content="#101215">
   <title>Umeko · 远程工作台</title>
   <link rel="stylesheet" href="./xterm.css"><link rel="stylesheet" href="./style.css">
-  <script src="./guacamole.js" defer></script><script src="./input.js" defer></script><script src="./xterm.js" defer></script><script src="./xterm-fit.js" defer></script><script src="./workspace.js" defer></script><script src="./desktop.js" defer></script><script src="./app.js" defer></script>
+  <script src="./guacamole.js" defer></script><script src="./input.js" defer></script><script src="./xterm.js" defer></script><script src="./xterm-fit.js" defer></script><script src="./workspace.js" defer></script><script src="./desktop.js" defer></script><script src="./clipboard.js" defer></script><script src="./app.js" defer></script>
 </head>
 <body>
   <header class="top"><a class="brand" href="/"><span class="mark">u<span>↗</span></span><span>umeko<small>REMOTE WORKSPACE</small></span></a><span class="private"><i></i> 私人工作台</span><a href="/">返回主站 ↗</a></header>
@@ -48,7 +48,7 @@
           <summary class="secondary" aria-label="连接信息与画面设置">连接 <span id="desktop-network-brief" aria-hidden="true"></span><span aria-hidden="true">▾</span></summary>
           <div class="desktop-settings-panel">
             <dl class="desktop-metrics">
-              <div title="此浏览器到云端中继的 WebSocket 往返时间"><dt>中继延迟</dt><dd id="desktop-latency">—</dd></div>
+              <div title="此浏览器到桌面网关的 WebSocket 往返时间"><dt>连接延迟</dt><dd id="desktop-latency">—</dd></div>
               <div title="此浏览器接收的实际桌面协议数据"><dt>桌面下行</dt><dd id="desktop-bitrate">—</dd></div>
               <div><dt>当前分辨率</dt><dd id="desktop-resolution">—</dd></div>
             </dl>
@@ -87,6 +87,14 @@
     <div class="tool-toolbar"><div><span class="eyebrow">UMEKO / WEB SSH</span><h2>网页终端</h2></div><span id="terminal-status" class="muted" role="status"></span><button id="terminal-copy" class="secondary">复制</button><button id="terminal-paste" class="secondary">粘贴</button><button id="terminal-interrupt" class="secondary">Ctrl C</button><button id="terminal-reconnect" class="secondary">重新连接</button><button id="close-terminal" class="danger">断开并返回 ×</button></div>
     <div id="terminal" aria-label="SSH 命令行"></div>
   </section>
-  <dialog id="clipboard-dialog"><form id="clipboard-form"><div class="dialog-heading"><h2>远程剪贴板</h2><button type="button" id="close-clipboard" class="text-button">×</button></div><p class="muted">从远程复制的文字会显示在这里。编辑并发送后，可在远程桌面粘贴。</p><textarea id="clipboard-text" rows="7" maxlength="32768" aria-label="剪贴板文字"></textarea><button class="primary">发送到远程剪贴板</button></form></dialog>
+  <dialog id="clipboard-dialog">
+    <form id="clipboard-form">
+      <div class="dialog-heading"><h2>远程剪贴板</h2><button type="button" id="close-clipboard" class="text-button" aria-label="关闭剪贴板">×</button></div>
+      <p class="muted">在远程桌面上用系统的复制、粘贴快捷键同步文字。也可以在这里手动传送。</p>
+      <textarea id="clipboard-text" rows="7" maxlength="131070" aria-label="剪贴板文字"></textarea>
+      <button class="primary" type="submit">发送到远程剪贴板</button>
+      <button class="secondary" id="clipboard-copy-local" type="button">复制到本机</button>
+    </form>
+  </dialog>
 </body>
 </html>

@@ -31,14 +31,16 @@ async function refresh() {
     show('loading', false); show('login', false); show('workspace');
     const { device } = value;
     $('device-name').textContent = device.name;
-    $('device-host').textContent = device.online ? `${device.status?.hostname || '已建立安全连接'} · ${device.status?.platform || '正在获取系统信息'}` : '连接器离线';
+    $('device-host').textContent = device.online ? `${value.local ? '局域网直连 · ' : ''}${device.status?.hostname || '已建立安全连接'} · ${device.status?.platform || '正在获取系统信息'}` : '连接器离线';
     $('online-badge').textContent = device.online ? '● 在线' : '○ 离线';
     $('online-badge').classList.toggle('online', device.online);
     $('uptime').textContent = device.status ? elapsed(device.status.uptime) : '—';
     $('ssh-state').textContent = device.online ? (device.status?.ssh ? '可连接' : '等待服务') : '—';
     $('rdp-state').textContent = device.online ? (device.status?.rdp ? '可连接' : '等待服务') : '—';
     $('last-seen').textContent = device.online ? '刚刚' : device.lastSeen ? new Date(device.lastSeen).toLocaleString('zh-CN', { hour12: false }) : '尚未连接';
-    $('offline-note').textContent = device.online ? '仅在本机连接器运行时允许远程访问。关闭连接器将断开桌面与 SSH 隧道。' : '离线可能是电脑关机、断网或连接器未启动。请提前在本机启动 Umeko 远程连接器。';
+    $('offline-note').textContent = value.local ? '此入口通过家庭局域网直连这台电脑。'
+      : device.online ? '仅在本机连接器运行时允许远程访问。关闭连接器将断开桌面与 SSH 隧道。'
+        : '离线可能是电脑关机、断网或连接器未启动。请提前在本机启动 Umeko 远程连接器。';
     $('connect-desktop').disabled = !device.online || !device.status?.rdp;
     UmekoWorkspace.setAvailable(value.webTools && device.online && device.status?.ssh);
     $('session-time').textContent = `登录有效至 ${new Date(expires).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
@@ -115,7 +117,11 @@ function closeDesktopMenus() {
 }
 
 function releaseConnection() {
-  if (attempt) attempt.password = '';
+  if (attempt) {
+    attempt.password = '';
+    attempt.clipboard?.close();
+  }
+  $('clipboard-text').value = '';
   attempt = null;
   for (const dispose of pointerCleanup) dispose();
   pointerCleanup = [];
@@ -282,12 +288,13 @@ async function openDesktop(context) {
     const element = desktopClient.getDisplay().getElement();
     pointerCleanup = [new Guacamole.Mouse(element), new Guacamole.Mouse.Touchscreen(element)]
       .map((source) => UmekoRemoteInput.bindPointer(source, desktopClient, () => $('display').focus()));
-    desktopClient.onclipboard = (stream, type) => {
-      if (type !== 'text/plain') { stream.sendAck('Only text is supported', 256); return; }
-      const reader = new Guacamole.StringReader(stream); let content = '';
-      reader.ontext = (text) => { if (content.length + text.length <= 32768) content += text; };
-      reader.onend = () => { if (attempt === current) $('clipboard-text').value = content; };
-    };
+    current.clipboard = UmekoRemoteClipboard.bind({
+      display: $('display'), client: desktopClient,
+      ready: () => attempt === current && !!current.connectedAt && !$('desktop-view').inert,
+      resetKeys: () => keyboard?.reset(),
+      showText: (text) => { $('clipboard-text').value = text; },
+      notice,
+    });
     desktopClient.connect();
   } catch (error) {
     const retryable = !error.status || error.status === 409 || error.status >= 500;
@@ -378,8 +385,19 @@ $('desktop-clipboard').addEventListener('click', () => $('clipboard-dialog').sho
 $('close-clipboard').addEventListener('click', () => $('clipboard-dialog').close());
 $('clipboard-form').addEventListener('submit', (event) => {
   event.preventDefault();
-  if (client) { const writer = new Guacamole.StringWriter(client.createClipboardStream('text/plain')); writer.sendText($('clipboard-text').value); writer.sendEnd(); }
-  $('clipboard-dialog').close(); $('display').focus();
+  if (attempt?.clipboard?.send($('clipboard-text').value)) {
+    $('clipboard-dialog').close();
+    $('display').focus();
+  }
+});
+$('clipboard-copy-local').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText($('clipboard-text').value);
+    notice('已复制到本机剪贴板');
+  } catch {
+    $('clipboard-text').select();
+    notice('请用系统的复制快捷键复制已选中的文字');
+  }
 });
 window.addEventListener('pagehide', () => { identity = null; disconnectDesktop(); });
 refresh();

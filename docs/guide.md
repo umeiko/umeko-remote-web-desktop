@@ -61,7 +61,7 @@ Host umeko-home
 - 系统密码仅短暂用于建立当前 RDP 会话，不写入配置、日志或数据库。
 - 管理界面禁止跨站嵌入，API 和浏览器 WebSocket 校验 Origin。设备与 SSH CLI 通过签名身份或一次性票据验证。
 - 连接器仅转发预先配置的 `127.0.0.1` SSH / RDP 端口，不提供任意目标地址或任意命令执行接口。
-- 不新增公网 SSH、RDP、VNC 或 guacd 监听端口。远程工作台只通过现有 HTTPS 入口访问。
+- 不新增公网 SSH、RDP、VNC 或 guacd 监听端口。可选的局域网 HTTPS 入口绑定私有 IPv4，并校验来源网段和站点地址。
 
 密钥文件遗失或泄露后，在安全的本地环境生成新密钥，将服务器相应公钥替换并重启 `umeko-remote`。重启会撤销全部会话和票据。不要把私钥、实际配置或系统密码提交到 Git。
 
@@ -163,6 +163,31 @@ journalctl --user -u umeko-remote-agent.service -n 30 --no-pager
 loginctl show-user "$USER" -p Linger
 ```
 
+### 家庭局域网入口
+
+在家中电脑运行一套工作台和仅监听回环地址的 guacd。LAN 模式直连本机回环上的 SSH 和 RDP，无需启动第二个连接器。将现有管理员的**公钥**填入本机配置的 `adminKeys`，在浏览器继续选择原来的 `.umeko-key`。
+
+将下列字段加入本机配置，并按实际主机名、网段和证书路径填写：
+
+```json
+{
+  "origin": "https://computer.local:8443",
+  "path": "/remote",
+  "port": 8443,
+  "guacdPort": 4822,
+  "desktopUser": "your-user",
+  "lan": {
+    "address": "192.168.1.10",
+    "subnet": "192.168.1.0/24",
+    "allowAddressOrigin": true,
+    "certFile": "/private/path/server.crt",
+    "keyFile": "/private/path/server.key"
+  }
+}
+```
+
+TLS 证书的 SAN 要包含访问的主机名。开启 `allowAddressOrigin` 时，还要包含监听 IP。若使用家庭 CA，首次使用时在访问设备上信任该 CA 的公开证书。按实际网络设置 DHCP 地址保留，以保持监听地址和证书一致。设置 `UMEKO_REMOTE_CONFIG` 后运行 `node remote/server.js`，开机运行可沿用 systemd 服务。网页 SSH 和文件管理使用单独的、仅允许从 `127.0.0.1` 验证的 SSH 密钥及本机 SSH 主机指纹。
+
 ## 验证与排障
 
 ```bash
@@ -175,7 +200,9 @@ journalctl -u umeko-remote -n 50 --no-pager
 
 无法连接桌面时，检查本机 xrdp 是否监听配置端口、连接器是否在线、guacd 服务是否运行。网页无法登录时，确认使用管理员密钥、浏览器支持 Ed25519 Web Crypto，并检查域名是否与配置的 origin 完全一致。
 
-桌面顶栏的「连接」菜单显示中继 RTT、实际桌面下行数据速率和当前分辨率。自动画质在链路拥塞或绘制积压时降低 JPEG 压缩质量上限，链路稳定后再逐步调高。也可选择「清晰」或「省流」。Guacamole 按区域决定使用 PNG 或 JPEG，因此下行速率会随画面变化。「应用分辨率」通过 RDP Display Update 通道调整桌面尺寸，短暂断线重连会沿用该尺寸。
+桌面顶栏的「连接」菜单显示到桌面网关的 RTT、实际桌面下行数据速率和当前分辨率。自动画质在链路拥塞或绘制积压时降低 JPEG 压缩质量上限，链路稳定后再逐步调高。也可选择「清晰」或「省流」。Guacamole 按区域决定使用 PNG 或 JPEG，因此下行速率会随画面变化。「应用分辨率」通过 RDP Display Update 通道调整桌面尺寸，短暂断线重连会沿用该尺寸。
+
+远程桌面获得焦点时，Mac 使用 `⌘C` / `⌘V`，Windows 和 Linux 使用 `Ctrl+C` / `Ctrl+V`。粘贴时先发送本机文字再发出远程粘贴快捷键，复制时等待远程返回文字并写入本机系统剪贴板。浏览器权限限制自动读取和写入，允许读取的浏览器还会在切回桌面后同步本机文字。遇到限制时，可用「剪贴板」里的「复制到本机」和「发送到远程剪贴板」。该功能传输纯文本。
 
 短暂断线后，工作台会在当前登录有效时重新申请一次性桌面票据。勾选自动重连并在工作台表单填写系统密码，可让重连带上该密码。密码仅保留在当前页面内存，手动断开、退出或关闭页面会清除。如果在 xrdp 的远端登录界面输入密码，浏览器重连时可能再次显示登录界面。
 

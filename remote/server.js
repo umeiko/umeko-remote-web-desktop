@@ -6,6 +6,7 @@ import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
+import os from 'node:os';
 import { createRequire } from 'node:module';
 import { pipeline } from 'node:stream';
 import { digest, randomToken, verifySignature } from './auth.js';
@@ -16,17 +17,58 @@ const root = dirname(fileURLToPath(import.meta.url));
 const dependencies = createRequire(import.meta.url);
 const fail = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const bounded = (number, min, max, fallback) => Number.isFinite(Number(number)) ? Math.max(min, Math.min(max, Math.round(Number(number)))) : fallback;
+const privateNetworks = new net.BlockList();
+privateNetworks.addSubnet('10.0.0.0', 8);
+privateNetworks.addSubnet('172.16.0.0', 12);
+privateNetworks.addSubnet('192.168.0.0', 16);
+
+function connectLoopback(port) {
+  return new Promise((accept, reject) => {
+    const socket = net.connect({ host: '127.0.0.1', port });
+    socket.setTimeout(1500, () => socket.destroy(new Error('本机服务连接超时')));
+    socket.once('error', reject);
+    socket.once('connect', () => { socket.setTimeout(0); accept(socket); });
+  });
+}
 
 export async function createRemoteServer(config) {
   const base = config.path || '/remote';
-  const origin = new URL(config.origin).origin;
+  const url = new URL(config.origin);
+  const origin = url.origin;
   const secure = origin.startsWith('https:');
-  if (!secure && !['localhost', '127.0.0.1'].includes(new URL(origin).hostname)) throw new Error('远程访问必须使用 HTTPS');
+  if (!secure && !['localhost', '127.0.0.1'].includes(url.hostname)) throw new Error('远程访问必须使用 HTTPS');
+  const lan = config.lan;
+  const lanOrigins = new Map();
+  let https, subnet;
+  const loopbackPorts = { ssh: lan?.sshPort ?? 22, rdp: lan?.rdpPort ?? 3389 };
+  if (lan) {
+    if (!secure || !net.isIPv4(lan.address) || !privateNetworks.check(lan.address)) {
+      throw new Error('局域网入口需要 HTTPS 和私有 IPv4 监听地址');
+    }
+    const [network, prefix, extra] = String(lan.subnet).split('/');
+    if (extra !== undefined || !net.isIPv4(network) || !/^\d{1,2}$/.test(prefix) || Number(prefix) < 8 || Number(prefix) > 32) {
+      throw new Error('请配置有效的局域网 IPv4 网段');
+    }
+    subnet = new net.BlockList();
+    subnet.addSubnet(network, Number(prefix));
+    if (!subnet.check(lan.address)) throw new Error('局域网监听地址必须位于指定网段');
+    for (const port of Object.values(loopbackPorts)) {
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('无效的本机服务端口');
+    }
+    const [cert, key] = await Promise.all([readFile(lan.certFile), readFile(lan.keyFile)]);
+    https = { cert, key, minVersion: 'TLSv1.2' };
+    lanOrigins.set(url.host, origin);
+    if (lan.allowAddressOrigin) {
+      const addressUrl = new URL(origin);
+      addressUrl.hostname = lan.address;
+      lanOrigins.set(addressUrl.host, addressUrl.origin);
+    }
+  }
   const cookieName = secure ? '__Secure-umeko_remote' : 'umeko_remote_dev';
   const logger = config.logger === false ? false : { ...(typeof config.logger === 'object' ? config.logger : {}),
     serializers: { req: (request) => ({ method: request.method, url: request.url.split('?')[0],
       remoteAddress: request.ip, remotePort: request.socket?.remotePort }) } };
-  const app = Fastify({ logger, bodyLimit: 16384, trustProxy: '127.0.0.1' });
+  const app = Fastify({ logger, bodyLimit: 16384, trustProxy: lan ? false : '127.0.0.1', ...(https && { https }) });
   await app.register(cookie);
   await app.register(websocket, { options: { maxPayload: 1024 * 1024, perMessageDeflate: false } });
   const challenges = new Map(), sessions = new Map(), tickets = new Map(), channels = new Map(), limits = new Map();
@@ -45,8 +87,9 @@ export async function createRemoteServer(config) {
       await rename(`${config.stateFile}.tmp`, config.stateFile);
     }).catch(() => app.log.warn('Unable to persist last-seen timestamp'));
   }
+  const requestOrigin = (request) => lan ? lanOrigins.get(request.headers.host?.toLowerCase()) : origin;
   const checkOrigin = (request, required = true) => {
-    if ((required || request.headers.origin) && request.headers.origin !== origin) throw fail('来源验证失败', 403);
+    if ((required || request.headers.origin) && request.headers.origin !== requestOrigin(request)) throw fail('来源验证失败', 403);
   };
   function rateLimit(request, name, count, windowMs = 60000) {
     const id = `${name}:${request.ip}`;
@@ -114,6 +157,7 @@ export async function createRemoteServer(config) {
     app.log.info('Remote device disconnected');
   }
   async function openChannel(service) {
+    if (lan) return connectLoopback(loopbackPorts[service]);
     const state = device;
     if (!state || state.socket.readyState !== 1) throw fail('本机连接器离线', 503);
     if (channels.size >= 12) throw fail('并发连接过多', 429);
@@ -129,6 +173,11 @@ export async function createRemoteServer(config) {
     pipeline(stream, socket, () => stream.destroy());
   }
   app.addHook('onRequest', async (request, reply) => {
+    if (lan) {
+      const peer = request.raw.socket.remoteAddress;
+      if (!net.isIPv4(peer) || !privateNetworks.check(peer) || !subnet.check(peer)) throw fail('此入口仅供局域网访问', 403);
+      if (!requestOrigin(request)) throw fail('局域网入口地址不匹配', 403);
+    }
     reply.header('Cache-Control', 'no-store').header('X-Content-Type-Options', 'nosniff')
       .header('Referrer-Policy', 'no-referrer').header('X-Frame-Options', 'DENY')
       .header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
@@ -144,6 +193,7 @@ export async function createRemoteServer(config) {
     [`${base}/`]: ['web/index.html', 'text/html; charset=utf-8'],
     [`${base}/app.js`]: ['web/app.js', 'text/javascript; charset=utf-8'],
     [`${base}/desktop.js`]: ['web/desktop.js', 'text/javascript; charset=utf-8'],
+    [`${base}/clipboard.js`]: ['web/clipboard.js', 'text/javascript; charset=utf-8'],
     [`${base}/workspace.js`]: ['web/workspace.js', 'text/javascript; charset=utf-8'],
     [`${base}/xterm.js`]: [dependencies.resolve('@xterm/xterm'), 'text/javascript; charset=utf-8'],
     [`${base}/xterm.css`]: [dependencies.resolve('@xterm/xterm/css/xterm.css'), 'text/css; charset=utf-8'],
@@ -153,6 +203,7 @@ export async function createRemoteServer(config) {
     [`${base}/guacamole.js`]: ['vendor/guacamole-common.js', 'text/javascript; charset=utf-8'],
     [`${base}/umeko-remote.mjs`]: ['client.js', 'text/javascript; charset=utf-8'],
   };
+  if (lan) app.get('/', async (request, reply) => reply.redirect(`${base}/`));
   app.get(base, async (request, reply) => reply.redirect(`${base}/`));
   for (const [url, [path, type]] of Object.entries(assets)) {
     const data = await readFile(resolve(root, path));
@@ -162,10 +213,12 @@ export async function createRemoteServer(config) {
     rateLimit(request, 'challenge', 20);
     if (challenges.size >= 2000) throw fail('请稍后再试', 429);
     const { role, keyId } = request.body || {};
-    if (!['admin', 'device'].includes(role) || typeof keyId !== 'string' || keyId.length > 100) throw fail('无效的密钥');
+    if (!['admin', 'device'].includes(role) || (lan && role === 'device') ||
+      typeof keyId !== 'string' || keyId.length > 100) throw fail('无效的密钥');
     const id = randomToken();
-    const challenge = `Umeko Remote v1\n${origin}${base}\n${role}\n${randomToken()}`;
-    challenges.set(id, { challenge, role, keyId, ip: request.ip, expires: Date.now() + 60000 });
+    const site = requestOrigin(request);
+    const challenge = `Umeko Remote v1\n${site}${base}\n${role}\n${randomToken()}`;
+    challenges.set(id, { challenge, role, keyId, site, ip: request.ip, expires: Date.now() + 60000 });
     return { id, challenge };
   });
   app.post(`${base}/api/verify`, async (request, reply) => {
@@ -173,8 +226,10 @@ export async function createRemoteServer(config) {
     const { id, signature } = request.body || {};
     const challenge = challenges.get(id);
     challenges.delete(id);
-    if (!challenge || challenge.expires <= Date.now() || challenge.ip !== request.ip) throw fail('验证已过期，请重新选择密钥', 401);
-    const key = challenge.role === 'admin' ? config.adminKeys.find((key) => key.id === challenge.keyId) : config.device.id === challenge.keyId ? config.device : null;
+    if (!challenge || challenge.expires <= Date.now() || challenge.ip !== request.ip ||
+      challenge.site !== requestOrigin(request)) throw fail('验证已过期，请重新选择密钥', 401);
+    const key = challenge.role === 'admin' ? config.adminKeys.find((key) => key.id === challenge.keyId)
+      : config.device?.id === challenge.keyId ? config.device : null;
     if (!key || typeof signature !== 'string' || !verifySignature(key.publicKey, challenge.challenge, signature)) throw fail('密钥验证失败', 401);
     if (challenge.role === 'device') return { ticket: issueTicket({ role: 'device' }) };
     if (sessions.size >= 64) throw fail('登录会话过多', 429);
@@ -186,10 +241,16 @@ export async function createRemoteServer(config) {
   });
   app.get(`${base}/api/status`, async (request) => {
     const session = getSession(request);
+    let localStatus;
+    if (lan) {
+      const probe = (port) => connectLoopback(port).then((socket) => { socket.destroy(); return true; }, () => false);
+      const [ssh, rdp] = await Promise.all([probe(loopbackPorts.ssh), probe(loopbackPorts.rdp)]);
+      localStatus = { ssh, rdp, hostname: os.hostname(), platform: `${os.platform()} ${os.release()}`, uptime: Math.round(os.uptime()) };
+    }
     return {
-      authenticated: true, expires: session.expires, webTools: webTools.enabled,
-      device: { name: config.device.name || '我的电脑', online: !!device, lastSeen,
-        connectedAt: device?.connectedAt || null, status: device?.status || null },
+      authenticated: true, expires: session.expires, webTools: webTools.enabled, local: !!lan,
+      device: { name: (lan || config.device).name || '我的电脑', online: !!(lan || device), lastSeen,
+        connectedAt: device?.connectedAt || null, status: localStatus || device?.status || null },
     };
   });
   app.post(`${base}/api/logout`, async (request, reply) => {
@@ -200,13 +261,13 @@ export async function createRemoteServer(config) {
   app.post(`${base}/api/ssh-ticket`, async (request) => {
     rateLimit(request, 'ssh-ticket', 40);
     const session = getSession(request);
-    if (!device) throw fail('本机连接器离线', 409);
+    if (!lan && !device) throw fail('本机连接器离线', 409);
     return { ticket: issueTicket({ role: 'ssh', sessionId: session.id }) };
   });
   app.post(`${base}/api/desktop-ticket`, async (request) => {
     rateLimit(request, 'desktop', 10);
     const session = getSession(request);
-    if (!device) throw fail('本机连接器离线', 409);
+    if (!lan && !device) throw fail('本机连接器离线', 409);
     const { username = config.desktopUser || '', password = '', width, height, quality = 90 } = request.body || {};
     if (typeof username !== 'string' || username.length > 128 || typeof password !== 'string' || password.length > 512) throw fail('登录信息格式不正确');
     return { ticket: issueTicket({ role: 'desktop', sessionId: session.id, username, password,
@@ -291,18 +352,22 @@ export async function createRemoteServer(config) {
       track(socket, credentials.sessionId);
       if (socket.readyState !== 1) return;
       try {
-        channel = await openChannel('rdp');
+        let rdpPort = loopbackPorts.rdp;
+        if (!lan) {
+          channel = await openChannel('rdp');
+          if (socket.readyState !== 1) return cleanup();
+          localServer = net.createServer((peer) => {
+            if (localPeer) return peer.destroy();
+            localPeer = peer;
+            localServer.close();
+            couple(peer, channel);
+          });
+          localServer.maxConnections = 1;
+          await new Promise((resolve, reject) => { localServer.once('error', reject); localServer.listen(0, '127.0.0.1', resolve); });
+          rdpPort = localServer.address().port;
+        }
         if (socket.readyState !== 1) return cleanup();
-        localServer = net.createServer((peer) => {
-          if (localPeer) return peer.destroy();
-          localPeer = peer;
-          localServer.close();
-          couple(peer, channel);
-        });
-        localServer.maxConnections = 1;
-        await new Promise((resolve, reject) => { localServer.once('error', reject); localServer.listen(0, '127.0.0.1', resolve); });
-        if (socket.readyState !== 1) return cleanup();
-        desktopSocket = await openDesktop({ guacdPort: config.guacdPort || 4822, rdpPort: localServer.address().port, ...credentials,
+        desktopSocket = await openDesktop({ guacdPort: config.guacdPort || 4822, rdpPort, ...credentials,
           onData: output.send, onSocket: (value) => { desktopSocket = value; output.bind(value); },
           onCapabilities: (capabilities) => {
             if (telemetry === true) output.control({ type: 'desktop', ...capabilities });
@@ -364,6 +429,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const path = process.env.UMEKO_REMOTE_CONFIG || '/etc/umeko-remote/server.json';
   const config = JSON.parse(await readFile(path, 'utf8'));
   const app = await createRemoteServer(config);
-  await app.listen({ port: config.port || 3101, host: '127.0.0.1' });
+  await app.listen({ port: config.port || 3101, host: config.lan?.address || '127.0.0.1' });
   for (const event of ['SIGINT', 'SIGTERM']) process.on(event, () => app.close().then(() => process.exit(0)));
 }
