@@ -2,7 +2,7 @@
 const $ = (id) => document.getElementById(id);
 const base = location.pathname.replace(/\/+$/, '');
 let identity = null, expires = 0, client = null, keyboard = null, noticeTimer;
-let pointerCleanup = [];
+let pointerCleanup = [], desktop = null, attempt = null, keySelection = 0;
 const show = (id, visible = true) => { $(id).hidden = !visible; };
 function notice(message) { $('notice').textContent = message; show('notice'); clearTimeout(noticeTimer); noticeTimer = setTimeout(() => show('notice', false), 6500); }
 async function api(path, data) {
@@ -12,7 +12,7 @@ async function api(path, data) {
   });
   if (response.status === 401 && path !== 'verify') signedOut();
   const value = await response.json();
-  if (!response.ok) throw new Error(value.error || '连接失败，请稍后再试');
+  if (!response.ok) throw Object.assign(new Error(value.error || '连接失败，请稍后再试'), { status: response.status });
   return value;
 }
 function signedOut() {
@@ -48,8 +48,12 @@ async function refresh() {
   }
 }
 $('identity').addEventListener('change', async (event) => {
+  const selection = ++keySelection;
   identity = null; $('login-button').disabled = true;
+  $('file-name').textContent = '选择 .umeko-key 密钥文件';
+  $('login-button').textContent = '选择密钥后安全登录';
   const file = event.target.files[0];
+  event.target.value = '';
   if (!file) return;
   try {
     if (file.size > 8192) throw new Error('密钥文件过大');
@@ -58,11 +62,11 @@ $('identity').addEventListener('change', async (event) => {
     const bytes = Uint8Array.from(atob(value.privateKey), (character) => character.charCodeAt(0));
     const key = await crypto.subtle.importKey('pkcs8', bytes, { name: 'Ed25519' }, false, ['sign']);
     bytes.fill(0);
+    if (selection !== keySelection) return;
     identity = { keyId: value.keyId, key };
     $('file-name').textContent = file.name;
     $('login-button').textContent = '安全登录 ↗'; $('login-button').disabled = false;
-  } catch (error) { notice(error.message || '无法读取密钥，请使用新版浏览器'); }
-  event.target.value = '';
+  } catch (error) { if (selection === keySelection) notice(error.message || '无法读取密钥，请使用新版浏览器'); }
 });
 $('login-button').addEventListener('click', async () => {
   if (!identity) return;
@@ -86,105 +90,183 @@ $('connect-desktop').addEventListener('click', () => $('desktop-login').showModa
 $('cancel-desktop').addEventListener('click', () => { $('desktop-password').value = ''; $('desktop-login').close(); });
 $('desktop-login').addEventListener('close', () => { $('desktop-password').value = ''; });
 
-// A Guacamole tunnel with a first-frame ticket, keeping credentials out of URLs.
-function createTunnel(ticket) {
-  const tunnel = new Guacamole.Tunnel();
-  let socket, pingTimer, lastReceived = Date.now(), intentional = false;
-  tunnel.connect = () => {
-    tunnel.setState(Guacamole.Tunnel.State.CONNECTING);
-    const parser = new Guacamole.Parser();
-    parser.oninstruction = (opcode, args) => {
-      if (tunnel.state === Guacamole.Tunnel.State.CONNECTING) {
-        if (opcode === '' && args.length === 1) tunnel.setUUID(args[0]);
-        tunnel.setState(Guacamole.Tunnel.State.OPEN);
-      }
-      if (opcode !== '' && tunnel.oninstruction) tunnel.oninstruction(opcode, args);
-    };
-    socket = new WebSocket(`${location.origin.replace(/^http/, 'ws')}${base}/ws/desktop`);
-    socket.onopen = () => {
-      socket.send(JSON.stringify({ ticket }));
-      pingTimer = setInterval(() => {
-        if (Date.now() - lastReceived > 45000) { socket.close(); return; }
-        if (tunnel.state === Guacamole.Tunnel.State.OPEN) tunnel.sendMessage('', 'ping', Date.now());
-      }, 10000);
-    };
-    socket.onmessage = (event) => { lastReceived = Date.now(); try { parser.receive(event.data); } catch { socket.close(); } };
-    socket.onclose = () => {
-      clearInterval(pingTimer); tunnel.setState(Guacamole.Tunnel.State.CLOSED);
-      if (!intentional && tunnel.onerror) tunnel.onerror(new Guacamole.Status(Guacamole.Status.Code.UPSTREAM_UNAVAILABLE, '桌面连接已关闭，请检查本机连接器或重新连接'));
-    };
-    socket.onerror = () => socket.close();
-  };
-  tunnel.sendMessage = (...args) => { if (socket?.readyState === WebSocket.OPEN) socket.send(Guacamole.Parser.toInstruction(args)); };
-  tunnel.disconnect = () => { intentional = true; clearInterval(pingTimer); socket?.close(); tunnel.setState(Guacamole.Tunnel.State.CLOSED); };
-  return tunnel;
-}
-function disconnectDesktop() {
+const retryDelays = [1000, 2400, 5000, 9500, 15000];
+const desktopUrl = `${location.origin.replace(/^http/, 'ws')}${base}/ws/desktop`;
+const desktopState = (message) => { $('desktop-state').textContent = message; };
+
+function releaseConnection() {
+  if (attempt) attempt.password = '';
+  attempt = null;
   for (const dispose of pointerCleanup) dispose();
   pointerCleanup = [];
-  keyboard?.reset(); keyboard = null;
-  client?.disconnect(); client = null;
+  keyboard?.reset();
+  if (client) {
+    client.onstatechange = null;
+    client.onerror = null;
+    client.disconnect();
+    client = null;
+  }
+}
+
+function disconnectDesktop() {
+  if (desktop) {
+    clearTimeout(desktop.timer);
+    desktop.password = '';
+    desktop = null;
+  }
+  releaseConnection();
   $('display').replaceChildren();
+  $('desktop-latency').textContent = '—';
+  $('desktop-bitrate').textContent = '—';
+  $('desktop-resolution').textContent = '—';
+  show('desktop-retry', false);
   show('desktop-view', false);
   document.body.classList.remove('remote-open');
   $('workspace').inert = false;
   $('mobile-input').classList.remove('open'); show('send-mobile', false);
   if (document.fullscreenElement === $('desktop-view')) document.exitFullscreen().catch(() => {});
 }
+
 function scaleDesktop() {
   if (!client) return;
   const display = client.getDisplay(), region = $('display');
-  if (!display.getWidth() || !display.getHeight()) return;
-  $('desktop-state').textContent = '安全连接已建立';
-  display.scale(Math.min(region.clientWidth / display.getWidth(), region.clientHeight / display.getHeight()));
+  const width = display.getWidth(), height = display.getHeight();
+  if (!width || !height) return;
+  $('desktop-resolution').textContent = `${width} × ${height}`;
+  display.scale(Math.min(region.clientWidth / width, region.clientHeight / height));
 }
-$('desktop-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const button = event.target.querySelector('button[type=submit], button.primary'); button.disabled = true;
+
+function requestDesktopSize(context) {
+  const { width, height } = UmekoRemoteDesktop.dimensions(context.viewport, context.mode, context.tier);
+  client?.sendSize(width, height);
+}
+
+function endAttempt(current, message, retryable = true) {
+  if (attempt !== current) return;
+  const context = current.context;
+  releaseConnection();
+  $('desktop-latency').textContent = '—';
+  $('desktop-bitrate').textContent = '—';
+  if (desktop !== context) return;
+  if (current.connectedAt && performance.now() - current.connectedAt > 30000) context.retries = 0;
+  if (context.auto && retryable && context.retries < retryDelays.length && Date.now() < expires) {
+    const delay = retryDelays[context.retries++];
+    if (context.mode === 'auto') context.tier = Math.min(3, context.tier + 1);
+    desktopState(`${message} · ${Math.ceil(delay / 1000)} 秒后重连（${context.retries}/${retryDelays.length}）`);
+    context.timer = setTimeout(() => openDesktop(context), delay);
+  } else {
+    context.password = '';
+    desktopState(message);
+    show('desktop-retry');
+  }
+}
+
+async function openDesktop(context) {
+  if (desktop !== context) return;
+  if (context.retries && document.hidden) {
+    desktopState('返回此页面后继续重连');
+    context.waiting = true;
+    return;
+  }
+  context.waiting = false;
+  const current = { context, connectedAt: 0, password: context.password };
+  attempt = current;
+  desktopState(context.retries ? '正在重新连接本机桌面…' : '正在连接…');
   try {
-    const credentials = { username: $('desktop-user').value, password: $('desktop-password').value,
-      width: Math.max(1024, Math.min(1920, innerWidth)), height: Math.max(768, Math.min(1080, innerHeight - 65)) };
-    $('desktop-password').value = '';
-    const { ticket } = await api('desktop-ticket', credentials);
-    credentials.password = '';
-    $('desktop-login').close(); disconnectDesktop(); show('desktop-view');
-    document.body.classList.add('remote-open'); $('workspace').inert = true;
-    $('desktop-state').textContent = '正在连接…';
-    const tunnel = createTunnel(ticket);
-    client = new Guacamole.Client(tunnel);
-    $('display').appendChild(client.getDisplay().getElement());
-    client.getDisplay().onresize = scaleDesktop;
-    client.onerror = (status) => { $('desktop-state').textContent = status.message || '连接发生错误'; notice(status.message || '桌面连接失败'); };
-    tunnel.onerror = (status) => { $('desktop-state').textContent = status.message; };
-    client.onstatechange = (state) => {
-      if (state === 3) { $('desktop-state').textContent = '正在连接本机桌面…'; scaleDesktop(); $('display').focus(); }
-      else if (state === 5) $('desktop-state').textContent = '连接已断开';
+    const size = UmekoRemoteDesktop.dimensions(context.viewport, context.mode, context.tier);
+    const { ticket } = await api('desktop-ticket', { ...size, username: context.username, password: context.password });
+    if (!context.auto) context.password = '';
+    if (attempt !== current) return;
+    const tunnel = UmekoRemoteDesktop.createTunnel({
+      url: desktopUrl, ticket,
+      onClosed: (code, hint) => endAttempt(current, hint || '桌面连接已断开', code !== 1008),
+      onStats: (stats) => {
+        if (attempt !== current) return;
+        $('desktop-latency').textContent = stats.rtt === null || stats.pingAge > 10000 ? '—' : `${stats.rtt} ms`;
+        $('desktop-bitrate').textContent = stats.bitrate >= 1000000
+          ? `${(stats.bitrate / 1000000).toFixed(2)} Mb/s` : `${Math.round(stats.bitrate / 1000)} kb/s`;
+        if (context.mode !== 'auto' || !current.connectedAt) return;
+        const tier = current.adaptive.sample(stats, performance.now());
+        if (tier !== null) { context.tier = tier; requestDesktopSize(context); }
+      },
+    });
+    current.adaptive = UmekoRemoteDesktop.adaptiveState(context.tier);
+    const desktopClient = new Guacamole.Client(tunnel);
+    client = desktopClient;
+    $('display').replaceChildren(desktopClient.getDisplay().getElement());
+    desktopClient.getDisplay().onresize = scaleDesktop;
+    desktopClient.onerror = (status) => {
+      const retryable = ![Guacamole.Status.Code.CLIENT_UNAUTHORIZED, Guacamole.Status.Code.CLIENT_FORBIDDEN,
+        Guacamole.Status.Code.CLIENT_BAD_REQUEST].includes(status.code);
+      endAttempt(current, status.message || '桌面连接失败', retryable);
     };
-    client.onrequired = (parameters) => {
-      // FreeRDP may ask for explicitly empty credentials before showing the
-      // xrdp system login screen. Do not leave the connection waiting silently.
-      $('desktop-state').textContent = '正在打开系统登录界面…';
-      for (const name of parameters) {
-        if (!['username', 'password', 'domain'].includes(name)) { notice('桌面网关请求了不支持的连接参数'); continue; }
-        const writer = new Guacamole.StringWriter(client.createArgumentValueStream('text/plain', name));
-        writer.sendText(''); writer.sendEnd();
+    desktopClient.onstatechange = (state) => {
+      if (state === Guacamole.Client.State.CONNECTED) {
+        current.connectedAt = performance.now();
+        current.password = '';
+        desktopState('已连接');
+        scaleDesktop();
+        if (!$('desktop-view').inert) $('display').focus();
+      } else if (state === Guacamole.Client.State.DISCONNECTED) {
+        // A protocol error may report its reason immediately after this event.
+        queueMicrotask(() => endAttempt(current, '桌面连接已断开'));
       }
     };
-    keyboard = new Guacamole.Keyboard($('display'));
-    keyboard.onkeydown = (keysym) => { client?.sendKeyEvent(1, keysym); return false; };
-    keyboard.onkeyup = (keysym) => { client?.sendKeyEvent(0, keysym); };
-    const mouse = new Guacamole.Mouse(client.getDisplay().getElement());
-    const touch = new Guacamole.Mouse.Touchscreen(client.getDisplay().getElement());
-    pointerCleanup = [mouse, touch].map((source) => UmekoRemoteInput.bindPointer(source, client, () => $('display').focus()));
-    client.onclipboard = (stream, type) => {
+    desktopClient.onrequired = (parameters) => {
+      const password = context.password || current.password;
+      desktopState(password ? '正在验证本机账号…' : '正在打开系统登录界面…');
+      for (const name of parameters) {
+        if (!['username', 'password', 'domain'].includes(name)) { notice('桌面网关请求了不支持的连接参数'); continue; }
+        const writer = new Guacamole.StringWriter(desktopClient.createArgumentValueStream('text/plain', name));
+        writer.sendText(name === 'password' ? password : name === 'username' && password ? context.username : '');
+        writer.sendEnd();
+      }
+    };
+    if (!keyboard) {
+      keyboard = new Guacamole.Keyboard($('display'));
+      keyboard.onkeydown = (keysym) => { client?.sendKeyEvent(1, keysym); return false; };
+      keyboard.onkeyup = (keysym) => { client?.sendKeyEvent(0, keysym); };
+    }
+    const element = desktopClient.getDisplay().getElement();
+    pointerCleanup = [new Guacamole.Mouse(element), new Guacamole.Mouse.Touchscreen(element)]
+      .map((source) => UmekoRemoteInput.bindPointer(source, desktopClient, () => $('display').focus()));
+    desktopClient.onclipboard = (stream, type) => {
       if (type !== 'text/plain') { stream.sendAck('Only text is supported', 256); return; }
       const reader = new Guacamole.StringReader(stream); let content = '';
       reader.ontext = (text) => { if (content.length + text.length <= 32768) content += text; };
-      reader.onend = () => { $('clipboard-text').value = content; };
+      reader.onend = () => { if (attempt === current) $('clipboard-text').value = content; };
     };
-    client.connect();
-  } catch (error) { notice(error.message); }
-  finally { button.disabled = false; }
+    desktopClient.connect();
+  } catch (error) {
+    const retryable = !error.status || error.status === 409 || error.status >= 500;
+    endAttempt(current, error.message || '无法打开远程桌面', retryable);
+  }
+}
+
+$('desktop-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const context = {
+    username: $('desktop-user').value, password: $('desktop-password').value,
+    auto: $('desktop-auto').checked, mode: $('desktop-quality').value, tier: 0, retries: 0,
+    viewport: { width: innerWidth, height: innerHeight - 85 },
+  };
+  $('desktop-password').value = '';
+  $('desktop-login').close();
+  disconnectDesktop(); show('desktop-view');
+  desktop = context;
+  document.body.classList.add('remote-open'); $('workspace').inert = true;
+  openDesktop(context);
+});
+$('desktop-retry').addEventListener('click', () => $('desktop-login').showModal());
+$('desktop-quality').addEventListener('change', () => {
+  if (!desktop) return;
+  desktop.mode = $('desktop-quality').value;
+  desktop.tier = 0;
+  if (attempt) attempt.adaptive = UmekoRemoteDesktop.adaptiveState();
+  requestDesktopSize(desktop);
+});
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && desktop?.waiting) openDesktop(desktop);
 });
 $('desktop-disconnect').addEventListener('click', disconnectDesktop);
 $('desktop-fullscreen').addEventListener('click', () => { if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); else $('desktop-view').requestFullscreen().catch(() => notice('浏览器不支持全屏')); });
@@ -215,6 +297,6 @@ $('clipboard-form').addEventListener('submit', (event) => {
   if (client) { const writer = new Guacamole.StringWriter(client.createClipboardStream('text/plain')); writer.sendText($('clipboard-text').value); writer.sendEnd(); }
   $('clipboard-dialog').close(); $('display').focus();
 });
-window.addEventListener('pagehide', () => { identity = null; client?.disconnect(); });
+window.addEventListener('pagehide', () => { identity = null; disconnectDesktop(); });
 refresh();
 setInterval(() => { if (expires && Date.now() >= expires) { signedOut(); notice('登录已到期，请重新使用密钥登录'); } else if (expires) refresh(); }, 10000);

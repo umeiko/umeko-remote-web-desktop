@@ -6,12 +6,14 @@ import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
+import { createRequire } from 'node:module';
 import { pipeline } from 'node:stream';
 import { digest, randomToken, verifySignature } from './auth.js';
 import { registerRemoteTools } from './tools.js';
-import { GuacParser, instruction, openDesktop } from './guacamole.js';
+import { desktopOutput, GuacParser, instruction, openDesktop } from './guacamole.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
+const dependencies = createRequire(import.meta.url);
 const fail = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const bounded = (number, min, max, fallback) => Number.isFinite(Number(number)) ? Math.max(min, Math.min(max, Math.round(Number(number)))) : fallback;
 
@@ -141,10 +143,11 @@ export async function createRemoteServer(config) {
   const assets = {
     [`${base}/`]: ['web/index.html', 'text/html; charset=utf-8'],
     [`${base}/app.js`]: ['web/app.js', 'text/javascript; charset=utf-8'],
+    [`${base}/desktop.js`]: ['web/desktop.js', 'text/javascript; charset=utf-8'],
     [`${base}/workspace.js`]: ['web/workspace.js', 'text/javascript; charset=utf-8'],
-    [`${base}/xterm.js`]: ['../node_modules/@xterm/xterm/lib/xterm.js', 'text/javascript; charset=utf-8'],
-    [`${base}/xterm.css`]: ['../node_modules/@xterm/xterm/css/xterm.css', 'text/css; charset=utf-8'],
-    [`${base}/xterm-fit.js`]: ['../node_modules/@xterm/addon-fit/lib/addon-fit.js', 'text/javascript; charset=utf-8'],
+    [`${base}/xterm.js`]: [dependencies.resolve('@xterm/xterm'), 'text/javascript; charset=utf-8'],
+    [`${base}/xterm.css`]: [dependencies.resolve('@xterm/xterm/css/xterm.css'), 'text/css; charset=utf-8'],
+    [`${base}/xterm-fit.js`]: [dependencies.resolve('@xterm/addon-fit'), 'text/javascript; charset=utf-8'],
     [`${base}/input.js`]: ['web/input.js', 'text/javascript; charset=utf-8'],
     [`${base}/style.css`]: ['web/style.css', 'text/css; charset=utf-8'],
     [`${base}/guacamole.js`]: ['vendor/guacamole-common.js', 'text/javascript; charset=utf-8'],
@@ -271,10 +274,16 @@ export async function createRemoteServer(config) {
   });
   app.get(`${base}/ws/desktop`, { websocket: true }, (socket, request) => {
     try { checkOrigin(request); getSession(request); rateLimit(request, 'desktop-ws', 15); } catch { return socket.close(1008); }
-    let desktopSocket, localServer, localPeer, channel;
-    const cleanup = () => { desktopSocket?.destroy(); localPeer?.destroy(); channel?.destroy(); localServer?.close(); };
-    socket.once('close', cleanup);
-    firstMessage(socket, async ({ ticket }) => {
+    let desktopSocket, localServer, localPeer, channel, opened = false;
+    const output = desktopOutput(socket);
+    const cleanup = () => {
+      output.stop(); desktopSocket?.destroy(); localPeer?.destroy(); channel?.destroy(); localServer?.close();
+    };
+    socket.once('close', (code) => {
+      cleanup();
+      if (opened) app.log.info({ code, peakQueueBytes: output.peak() }, 'Remote desktop closed');
+    });
+    firstMessage(socket, async ({ ticket, telemetry }) => {
       const credentials = takeTicket(ticket, 'desktop');
       // The ticket must belong to the browser's current session.
       if (credentials.sessionId !== getSession(request).id) throw fail('Invalid session');
@@ -292,18 +301,20 @@ export async function createRemoteServer(config) {
         localServer.maxConnections = 1;
         await new Promise((resolve, reject) => { localServer.once('error', reject); localServer.listen(0, '127.0.0.1', resolve); });
         if (socket.readyState !== 1) return cleanup();
-        const send = (text) => {
-          if (socket.readyState !== 1) return;
-          if (socket.bufferedAmount > 8 * 1024 * 1024) return socket.close(1008, 'Client too slow');
-          socket.send(text);
-        };
         desktopSocket = await openDesktop({ guacdPort: config.guacdPort || 4822, rdpPort: localServer.address().port, ...credentials,
-          onData: send, onSocket: (value) => { desktopSocket = value; } });
+          onData: output.send, onSocket: (value) => { desktopSocket = value; output.bind(value); } });
         credentials.password = '';
         if (socket.readyState !== 1) return cleanup();
+        let lastProbe = 0;
         const input = new GuacParser(([opcode, ...args]) => {
-          if (opcode === '') send(instruction('', ...args));
-          else desktopSocket.write(instruction(opcode, ...args));
+          if (opcode !== '') {
+            desktopSocket.write(instruction(opcode, ...args));
+            return;
+          }
+          if (args.length !== 2 || args[0] !== 'ping' || !/^\d{1,16}$/.test(args[1]) || Date.now() - lastProbe < 500) return;
+          lastProbe = Date.now();
+          if (telemetry === true) output.control({ type: 'pong', stamp: args[1], queued: output.buffered() });
+          else output.send(instruction('', ...args));
         });
         socket.on('message', (raw, binary) => {
           if (binary || raw.length > 65536 || desktopSocket.writableLength > 1024 * 1024) return socket.close(1008, 'Invalid desktop input');
@@ -311,6 +322,7 @@ export async function createRemoteServer(config) {
         });
         desktopSocket.once('close', () => socket.close(1000, 'Desktop closed'));
         desktopSocket.on('error', () => socket.close(1011, 'Desktop error'));
+        opened = true;
         app.log.info('Remote desktop opened');
       } catch {
         credentials.password = '';

@@ -48,7 +48,7 @@ export async function openDesktop({ guacdPort, rdpPort, username, password, widt
       if (opcode === 'args') {
         const parameters = {
           hostname: '127.0.0.1', port: String(rdpPort), username, password,
-          security: 'tls', 'ignore-cert': 'true', 'disable-auth': 'true',
+          security: 'tls', 'ignore-cert': 'true', 'disable-auth': password ? 'false' : 'true',
           'enable-wallpaper': 'false', 'enable-theming': 'false', 'enable-font-smoothing': 'true',
           'resize-method': 'display-update', 'disable-audio': 'true',
           'enable-drive': 'false', 'enable-printing': 'false', 'disable-upload': 'true', 'disable-download': 'true',
@@ -80,4 +80,48 @@ export async function openDesktop({ guacdPort, rdpPort, username, password, widt
     socket.on('error', () => { clearTimeout(timeout); reject(new Error('桌面网关不可用')); });
     socket.on('close', () => { clearTimeout(timeout); if (!ready) reject(new Error('桌面网关连接已关闭')); });
   });
+}
+
+// Preserve the order of the display stream while letting TCP backpressure
+// reach guacd. Control messages use separate binary WebSocket frames.
+export function desktopOutput(web, { high = 768 * 1024, low = 192 * 1024, timeoutMs = 25000 } = {}) {
+  let upstream, timer, pausedAt = null, peak = 0;
+  const buffered = () => web.bufferedAmount;
+  function stop() {
+    clearInterval(timer);
+    timer = null;
+    pausedAt = null;
+  }
+  function track() {
+    const queued = buffered();
+    peak = Math.max(peak, queued);
+    if (queued < high || pausedAt !== null || !upstream || web.readyState !== 1) return;
+    pausedAt = Date.now();
+    upstream.pause();
+    timer = setInterval(() => {
+      if (web.readyState !== 1 || upstream.destroyed) return stop();
+      if (buffered() <= low) {
+        stop();
+        upstream.resume();
+      } else if (Date.now() - pausedAt >= timeoutMs) {
+        stop();
+        web.close(1013, 'Desktop output stalled');
+      }
+    }, 80);
+    timer.unref?.();
+  }
+  return {
+    bind(socket) { upstream = socket; },
+    send(text) {
+      if (web.readyState !== 1) return;
+      web.send(text);
+      track();
+    },
+    control(data) {
+      if (web.readyState === 1 && buffered() < high + 128 * 1024) web.send(Buffer.from(JSON.stringify(data)));
+    },
+    stop,
+    buffered,
+    peak: () => peak,
+  };
 }

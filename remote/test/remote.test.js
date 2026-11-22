@@ -11,7 +11,7 @@ import { createRemoteServer } from '../server.js';
 import { keyId, loadIdentity, loginWithKey } from '../auth.js';
 import { startAgent } from '../agent.js';
 import { openSshTunnel } from '../client.js';
-import { GuacParser, instruction } from '../guacamole.js';
+import { desktopOutput, GuacParser, instruction } from '../guacamole.js';
 
 async function listen(server) { server.listen(0, '127.0.0.1'); await once(server, 'listening'); return server.address().port; }
 async function until(check) { for (let n = 0; n < 100; n++) { if (await check()) return; await delay(20); } throw new Error('Condition timed out'); }
@@ -148,6 +148,30 @@ test('desktop performs guacd handshake, relays the RDP port and handles internal
   await until(() => output.includes(instruction('', 'ping', '12345')));
   socket.send(instruction('key', 97, 1));
   await until(() => keyData === '97,1');
+});
+
+test('desktop traffic pauses under backpressure, resumes in order, and times out a sustained stall', async () => {
+  const events = [];
+  const browser = {
+    readyState: 1, bufferedAmount: 0,
+    send(value) { events.push(value); this.bufferedAmount += Buffer.byteLength(value); },
+    close(code) { events.push(code); this.readyState = 3; },
+  };
+  const upstream = { pause() { events.push('pause'); }, resume() { events.push('resume'); } };
+  const output = desktopOutput(browser, { high: 10, low: 4, timeoutMs: 100 });
+  try {
+    output.bind(upstream);
+    output.send('1234567890');
+    assert.deepEqual(events, ['1234567890', 'pause']);
+    output.control({ type: 'pong' });
+    assert.ok(Buffer.isBuffer(events.at(-1)));
+    browser.bufferedAmount = 3;
+    await until(() => events.at(-1) === 'resume');
+    output.send('abcdefghij');
+    assert.equal(events.at(-1), 'pause');
+    await until(() => events.at(-1) === 1013);
+    assert.ok(output.peak() >= 10);
+  } finally { output.stop(); }
 });
 
 test('expired sessions lose HTTP access and close their active sockets', async (t) => {
